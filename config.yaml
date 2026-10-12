@@ -1,0 +1,42 @@
+name: "DeoVR Server"
+version: "1.2.5"
+slug: deovr_server
+description: "Eigene VR-Videos, Webseiten und yt-dlp-Quellen im DeoVR-Format streamen (Meta Quest)"
+arch:
+  - amd64
+  - aarch64
+startup: services
+boot: auto
+init: false
+ports:
+  8000/tcp: 8000
+ports_description:
+  8000/tcp: "DeoVR-Server (Bibliothek unter /deovr)"
+webui: "http://[HOST]:[PORT:8000]/debug"
+map:
+  - media:rw
+  - share:rw
+options:
+  video_dir: "/media/deovr"
+  update_ytdlp: true
+  auto_format: true
+  sources: []
+schema:
+  video_dir: str
+  public_url: str?
+  default_format: str?
+  auto_format: bool?
+  update_ytdlp: bool?
+  sources:
+    - name: str
+      url: str
+      type: list(web|ytdlp)?
+      format: str?
+      proxy: bool?
+      depth: int?
+      max_pages: int?
+      limit: int?
+      max_height: int?
+      warmup: bool?
+      link_pattern: str?
+      cookies: str?
