@@ -71,6 +71,8 @@ Die Quellen werden beim Start und danach alle 30 Minuten neu eingelesen. Über `
 - `public_url`: Feste Basisadresse für alle Links in den JSON-Antworten, z. B. `http://192.168.1.50:8000`. Nötig, wenn du die Bibliothek unter einem Namen wie `homeassistant.local` öffnest und DeoVR Vorschaubilder oder Videos darüber nicht laden kann.
 - `update_ytdlp`: yt-dlp beim Start aktualisieren (Standard `true`).
 - `auto_format`: VR-Format automatisch aus der Bildgröße erkennen (Standard `true`).
+- `thumb_inline`: (Test) Vorschaubilder klein direkt in die Bibliothek einbetten statt als Adresse. Hilft, wenn DeoVR die Bild-Adressen nicht abruft. Macht die Bibliothek größer.
+- `hide_broken`: Lokale Dateien, die ffprobe nicht lesen kann (defekt, unvollständig), in DeoVR ausblenden (Standard `true`). Auf `/debug` stehen sie weiter.
 - `default_format`: Format für lokale Videos, deren Name keinen Hinweis enthält, z. B. `180_LR`. Leer lassen, wenn die automatische Erkennung entscheiden soll.
 
 ## Format über den Dateinamen
@@ -93,6 +95,11 @@ Steht im Namen nichts und gibt es keine feste Vorgabe, schaut das Add-on auf die
 | anderes | | flach |
 
 Das ist eine Faustregel. Ein 2:1-Video kann auch ein 360°-Video in Mono sein. Dann den Namen mit `360` ergänzen oder `format` setzen. Bei Webquellen ist die Bildgröße erst nach dem Auflösen im Hintergrund bekannt, auf `/debug` steht pro Video das erkannte Format. Mit `auto_format: false` wird nichts geraten.
+
+### Format von Hand einstellen
+Auf `/debug` hat jedes Video in der Tabelle „Videos“ ein Auswahlfeld unter dem erkannten Format (automatisch, 2D, 180°/360° als Side-by-Side, Top-Bottom oder Mono, Fisheye …). Die Wahl gilt sofort und hat Vorrang vor Dateiname, Quellen-Vorgabe und Auto-Erkennung. Sie wird gespeichert und übersteht Neustarts. „automatisch“ nimmt sie zurück. In DeoVR die Bibliothek danach neu öffnen.
+
+DeoVR blendet den eigenen Projektions-Button aus, sobald die JSON ein Format vorgibt. Deshalb gibt es diese Einstellung auf der Server-Seite.
 
 ## In DeoVR öffnen
 Im DeoVR-Browser auf der Quest: `http://<HA-IP>:8000/deovr` (am besten mit der IP, nicht mit einem Namen).

@@ -15,6 +15,7 @@ Start:  python server.py
 In DeoVR (Quest) im Browser öffnen:  http://<IP>:8000/deovr
 Diagnose im Browser:                 http://<IP>:8000/debug
 """
+import base64
 import hashlib
 import html
 import ipaddress
@@ -36,7 +37,7 @@ from flask import (Flask, Response, abort, jsonify, redirect, request,
                    send_file, stream_with_context)
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-VERSION = "1.2.5"
+VERSION = "1.3.0"
 VIDEO_DIR = Path(os.environ.get("VIDEO_DIR", "videos")).resolve()
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "cache")).resolve()
 PORT = int(os.environ.get("PORT", 8000))
@@ -72,6 +73,11 @@ _OPTS = _load_options()
 # Format für lokale Videos, deren Name keinen Hinweis enthält, z. B. "180_LR". Leer = automatisch.
 DEFAULT_FORMAT = (os.environ.get("DEFAULT_FORMAT") or _OPTS.get("default_format") or "").strip()
 AUTO_FORMAT = str(os.environ.get("AUTO_FORMAT", _OPTS.get("auto_format", True))).lower() not in ("0", "false", "no")
+THUMB_INLINE = str(os.environ.get("THUMB_INLINE", _OPTS.get("thumb_inline", False))).lower() in ("1", "true", "yes")
+HIDE_BROKEN = str(os.environ.get("HIDE_BROKEN", _OPTS.get("hide_broken", True))).lower() not in ("0", "false", "no")
+# "json": Format steht in der JSON (DeoVR fixiert die Projektion). "filename": Format steht nur im
+# Dateinamen der Video-Adresse; DeoVR erkennt es daran und lässt die Projektion im Menü änderbar.
+FORMAT_MODE = (os.environ.get("FORMAT_MODE") or _OPTS.get("format_mode") or "json").strip().lower()
 
 # Auflösung/Länge von Webvideos merken (übersteht Neustarts): Item-ID -> {"w", "h", "dur"}
 _META_FILE = CACHE_DIR / "meta.json"
@@ -101,6 +107,7 @@ app = Flask(__name__)
 # Hinter einem Reverse Proxy die Original-Adresse/Schema übernehmen
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 _probe_cache = {}
+_broken = {}   # (id, mtime) -> Fehlertext für lokale Dateien, die ffprobe nicht lesen kann
 _thumb_errors = {}  # Item-ID -> letzter Fehlertext der Thumbnail-Erzeugung
 _page_info = {}     # URL -> Kennzahlen der zuletzt gelesenen Seite
 _page_links = {}    # URL -> Links der zuletzt gelesenen Seite
@@ -109,6 +116,7 @@ _local_cache = {"ts": 0.0, "items": []}  # Dateiliste kurz zwischenspeichern
 _requests = []      # die letzten Anfragen (für /debug): Zeit, Client, Pfad, Status, User-Agent
 _requests_lock = threading.Lock()
 _stats = {}       # Art der Anfrage -> {Status: Anzahl}; wird nicht abgeschnitten wie die Liste oben
+_thumb_log = []   # die letzten Vorschaubild-Anfragen
 _stats_last = {}  # Art der Anfrage -> (Zeit, User-Agent) der letzten Anfrage
 _req_thumb_slots = threading.Semaphore(6)   # Thumbnails, die DeoVR gerade anfragt, überholen die Hintergrundarbeit
 _thumb_slots = threading.Semaphore(3)       # höchstens 3 ffmpeg-Thumbnails gleichzeitig
@@ -198,9 +206,46 @@ def item_dims(it):
     return None
 
 
+FORMAT_CHOICES = [
+    ("", "automatisch"),
+    ("flat", "2D (flach)"),
+    ("180_LR", "180° Side-by-Side"),
+    ("180_TB", "180° Top-Bottom"),
+    ("180", "180° Mono"),
+    ("360_TB", "360° Top-Bottom"),
+    ("360_LR", "360° Side-by-Side"),
+    ("360", "360° Mono"),
+    ("FISHEYE_LR", "Fisheye 180° SBS"),
+    ("FISHEYE190_LR", "Fisheye 190° SBS"),
+    ("MKX200_LR", "MKX200 SBS"),
+    ("SBS", "Flach + Side-by-Side (3D-Film)"),
+    ("TB", "Flach + Top-Bottom (3D-Film)"),
+]
+_FORMATS_FILE = CACHE_DIR / "formats.json"
+_formats = {}  # Video-ID -> von dir in /debug gewähltes Format (hat Vorrang vor allem anderen)
+try:
+    _formats = json.loads(_FORMATS_FILE.read_text(encoding="utf-8"))
+except Exception:
+    _formats = {}
+
+
+def set_format(i, fmt):
+    if fmt:
+        _formats[i] = fmt
+    else:
+        _formats.pop(i, None)
+    try:
+        _FORMATS_FILE.write_text(json.dumps(_formats), encoding="utf-8")
+    except OSError as e:
+        print(f"[formats] konnte nicht speichern: {e}")
+
+
 def format_of(it):
     """Format: 1. Angaben im Namen, 2. Vorgabe 'format' der Quelle (bei lokalen Videos 'default_format'),
     3. automatisch aus der Bildgröße. 'format: auto' schaltet die Vorgabe ab."""
+    ov = _formats.get(it["id"])
+    if ov:
+        return detect_format(ov)
     screen, stereo = detect_format(it["name"])
     explicit = (it.get("fmt") or (DEFAULT_FORMAT if it["kind"] == "local" else "")).strip()
     if explicit.lower() == "auto":
@@ -281,6 +326,27 @@ def numeric_id(i: str) -> int:
     return int(i[:7], 16)
 
 
+def thumb_path(i: str) -> str:
+    """Vorschaubild-Adresse mit Versionsteil: DeoVR merkt sich Bilder (auch fehlgeschlagene) pro Adresse.
+    Ändert sich die Version, holt es sie neu."""
+    return f"/thumb/v{VERSION.replace('.', '')}/{i}.jpg"
+
+
+_NAME_FLAGS = {"dome": "180", "sphere": "360", "fisheye": "FISHEYE", "mkx200": "MKX200", "rf52": "FISHEYE190"}
+
+
+def filename_flags(screen, stereo) -> str:
+    """Teile, an denen DeoVR das Format im Dateinamen erkennt, z. B. '_180_LR'."""
+    parts = []
+    if screen in _NAME_FLAGS:
+        parts.append(_NAME_FLAGS[screen])
+    if stereo == "sbs":
+        parts.append("LR")
+    elif stereo == "tb":
+        parts.append("TB")
+    return "".join("_" + p for p in parts)
+
+
 def validate_detail(d: dict):
     """Prüft eine Video-JSON grob gegen das Beispiel der DeoVR-Doku."""
     p = []
@@ -292,7 +358,7 @@ def validate_detail(d: dict):
         p.append("videoLength ist keine Zahl")
     if not isinstance(d.get("is3d"), bool):
         p.append("is3d ist kein true/false")
-    if d.get("screenType") not in ("flat", "dome", "sphere", "fisheye", "mkx200", "rf52"):
+    if FORMAT_MODE != "filename" and d.get("screenType") not in ("flat", "dome", "sphere", "fisheye", "mkx200", "rf52"):
         p.append("screenType unbekannt")
     if d.get("is3d") and d.get("stereoMode") not in ("sbs", "tb", "cuv", "off"):
         p.append("stereoMode fehlt oder unbekannt")
@@ -447,6 +513,8 @@ def probe(it, network=True) -> dict:
         return _probe_cache[key]
 
     info = _probe_default()
+    if local and key in _broken:
+        return info  # schon als defekt bekannt, nicht jedes Mal neu versuchen
     if not local and not network:
         return info
     if not FFPROBE:
@@ -475,7 +543,19 @@ def probe(it, network=True) -> dict:
         _probe_cache[key] = info
     except Exception as e:
         print(f"[ffprobe] Fehler bei {it['name']}: {e}")
+        if local:
+            _broken[key] = "Datei nicht lesbar (ffprobe schlägt fehl, z. B. fehlendes moov-Atom bei abgebrochenem Download)"
     return info
+
+
+def is_broken(it) -> bool:
+    """Lokale Datei, die ffprobe nicht lesen konnte (defekt, unvollständig)."""
+    if it["kind"] != "local":
+        return False
+    try:
+        return _probe_key(it) in _broken
+    except OSError:
+        return False
 
 
 def cached_probe(it) -> dict:
@@ -600,6 +680,11 @@ def make_thumb(it, slots=None):
         if got:
             return got
 
+    if it["kind"] == "local":
+        probe(it)
+        if is_broken(it):
+            _thumb_errors[it["id"]] = "Datei defekt, kein Vorschaubild möglich"
+            return None
     with slots:
         if out.exists() and out.stat().st_size > 0:
             return out
@@ -643,6 +728,50 @@ def make_thumb(it, slots=None):
             _thumb_errors[it["id"]] = f"ffmpeg (bei {ts}s): {tail}"
             print(f"[ffmpeg] Thumbnail für {it['name']} bei {ts}s fehlgeschlagen:\n{tail}")
     return None
+
+
+_inline_cache = {}  # id -> data-URI (kleine Vorschaubilder direkt in der Bibliothek)
+
+
+def small_thumb_uri(it):
+    """Kleines Vorschaubild als data:-URI, falls schon erzeugt. Startet nichts."""
+    i = it["id"]
+    if i in _inline_cache:
+        return _inline_cache[i]
+    small = CACHE_DIR / f"{i}.small.jpeg"
+    if small.exists() and small.stat().st_size > 0:
+        uri = "data:image/jpeg;base64," + base64.b64encode(small.read_bytes()).decode()
+        _inline_cache[i] = uri
+        return uri
+    return None
+
+
+def make_small_thumb(it):
+    big = CACHE_DIR / f"{it['id']}.jpg"
+    small = CACHE_DIR / f"{it['id']}.small.jpeg"
+    if small.exists() or not big.exists() or not FFMPEG:
+        return
+    subprocess.run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-i", str(big),
+                    "-vf", "scale=256:-2", "-q:v", "7", str(small)],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+
+
+def inline_thumb_worker():
+    """Option thumb_inline: erzeugt für alle Einträge (auch Webquellen) Vorschaubilder und deren
+    kleine Fassung für die Bibliothek. Läuft alle 2 Minuten, bis alles da ist."""
+    while True:
+        missing = 0
+        try:
+            for it in all_items():
+                big = CACHE_DIR / f"{it['id']}.jpg"
+                if not big.exists() and it["kind"] != "local":
+                    _thumb_from_page(it, big)
+                make_small_thumb(it)
+                if not (CACHE_DIR / f"{it['id']}.small.jpeg").exists():
+                    missing += 1
+        except Exception as e:
+            print(f"[inline-thumbs] {e}")
+        time.sleep(5 if missing else 120)
 
 
 def pregenerate():
@@ -1073,6 +1202,10 @@ def log_request(resp):
     """Merkt sich die letzten Anfragen, damit /debug zeigt, was die Quest wirklich abruft."""
     if request.path in ("/debug", "/selftest", "/favicon.ico"):
         return resp
+    # Bilder und Links, die die Diagnoseseite selbst lädt, zählen nicht (sonst sieht man nicht,
+    # was die Quest abruft)
+    if (request.headers.get("Referer") or "").split("?")[0].rstrip("/").endswith("/debug"):
+        return resp
     entry = (time.strftime("%H:%M:%S"), request.remote_addr or "?", request.method,
              request.full_path.rstrip("?"), resp.status_code,
              (request.headers.get("User-Agent") or "")[:80],
@@ -1089,6 +1222,9 @@ def log_request(resp):
         s[resp.status_code] = s.get(resp.status_code, 0) + 1
         if kind != "sonstige":
             _stats_last[kind] = (entry[0], entry[5])
+        if kind == "Vorschaubild":
+            _thumb_log.append(entry)
+            del _thumb_log[:-15]
     return resp
 
 
@@ -1199,12 +1335,14 @@ def selftest():
 def deovr_library():
     cats = {}
     for it in all_items():
+        if HIDE_BROKEN and is_broken(it):
+            continue
         i = it["id"]
         cats.setdefault(it["cat"], []).append({
             "title": it["title"],
             "videoLength": (it.get("duration") or (_meta.get(it["id"]) or {}).get("dur")
                             or cached_probe(it)["duration"]),
-            "thumbnailUrl": f"{base_url()}/thumb/{i}.jpg",
+            "thumbnailUrl": (small_thumb_uri(it) if THUMB_INLINE else None) or f"{base_url()}{thumb_path(i)}",
             "video_url": f"{base_url()}/deovr/{i}",
         })
     return jsonify({"scenes": [{"name": c, "list": l} for c, l in cats.items()]})
@@ -1228,16 +1366,14 @@ def deovr_video(i):
         info = cached_probe(it)
     screen, stereo = format_of(it)  # erst jetzt: die Bildgröße ist nun bekannt
 
+    flags = filename_flags(screen, stereo) if FORMAT_MODE == "filename" else ""
     if it["kind"] == "remote" and not it["proxy"]:
         url = it["url"]  # direkter Link zur Originaldatei
     else:
-        url = f"{base_url()}/video/{i}{it['ext']}"
+        url = f"{base_url()}/video/{i}{flags}{it['ext']}"
 
-    thumb_url = f"{base_url()}/thumb/{i}.jpg"
+    thumb_url = f"{base_url()}{thumb_path(i)}"
     video_source = {"resolution": info["height"], "url": url}
-    dims = item_dims(it)
-    if dims:
-        video_source["width"], video_source["height"] = dims
     data = {
         "id": numeric_id(i),
         "title": it["title"],
@@ -1248,11 +1384,6 @@ def deovr_video(i):
         # Laut DeoVR-Doku soll is3d immer true sein, sonst erzwingt DeoVR Mono und blendet die
         # Projektionen aus. Mono wird über stereoMode "off" ausgedrückt (so macht es auch XBVR).
         "is3d": True,
-        "screenType": screen,
-        "stereoMode": stereo or "off",
-        "fullVideoReady": True,
-        "fullAccess": True,
-        "timeStamps": [],
         # Laut DeoVR-Doku ist "h264" der dokumentierte Name; der echte Codec
         # (z. B. hevc) wird vom Player aus der Datei selbst erkannt.
         "encodings": [{
@@ -1260,12 +1391,16 @@ def deovr_video(i):
             "videoSources": [video_source],
         }],
     }
+    if FORMAT_MODE != "filename":
+        data["screenType"] = screen
+        data["stereoMode"] = stereo or "off"
     _last_detail[:] = [json.dumps(data, indent=1, ensure_ascii=False)]
     return jsonify(data)
 
 
 @app.route("/video/<i>.<ext>")
 def video(i, ext):
+    i = i.split("_")[0]  # Format-Anhang im Dateinamen (z. B. abc123_180_LR) abschneiden
     it = find_item(i)
     if not it:
         abort(404)
@@ -1275,6 +1410,11 @@ def video(i, ext):
     if it["kind"] == "ytdlp" or it["proxy"]:
         return proxy_stream(it)
     return redirect(it["url"], 302)
+
+
+@app.route("/thumb/<v>/<i>.jpg")
+def thumb_versioned(v, i):
+    return thumb(i)
 
 
 @app.route("/thumb/<i>.jpg")
@@ -1288,10 +1428,28 @@ def thumb(i):
     return send_file(out, mimetype="image/jpeg", max_age=86400)
 
 
+@app.route("/setformat")
+def setformat():
+    i = request.args.get("id", "")
+    fmt = request.args.get("fmt", "")
+    if not find_item(i) or fmt not in {c for c, _ in FORMAT_CHOICES}:
+        abort(400)
+    set_format(i, fmt)
+    _inline_cache.pop(i, None)
+    return redirect(f"/debug#v{i}")
+
+
 @app.route("/refresh")
 def refresh():
     threading.Thread(target=refresh_all, daemon=True).start()
     return redirect("/debug")
+
+
+def format_select(i):
+    cur = _formats.get(i, "")
+    opts = "".join(f"<option value='{v}'{' selected' if v == cur else ''}>{html.escape(t)}</option>"
+                   for v, t in FORMAT_CHOICES)
+    return f"<select onchange=\"location='/setformat?id={i}&fmt='+encodeURIComponent(this.value)\">{opts}</select>"
 
 
 @app.route("/debug")
@@ -1301,10 +1459,12 @@ def debug():
         info = cached_probe(it)
         screen, stereo = format_of(it)
         w = "<br>".join(html.escape(x) for x in warnings_for(info)) or "–"
+        if is_broken(it):
+            w = html.escape(_broken[_probe_key(it)])
         if it["kind"] == "ytdlp" and it["id"] in _resolve_errors:
             w = html.escape("yt-dlp: " + _resolve_errors[it["id"]])
         thumb_ok = (CACHE_DIR / f"{it['id']}.jpg").exists()
-        thumb_txt = "ja" if thumb_ok else "nein"
+        thumb_txt = f"<img class='t' src='/thumb/{it['id']}.jpg' loading='lazy'>" if thumb_ok else "nein"
         if not thumb_ok and it["id"] in _thumb_errors:
             thumb_txt += "<br><small>" + html.escape(_thumb_errors[it["id"]][-300:]) + "</small>"
         codec = (f"{info['vcodec']} {info['profile']} {info['pix_fmt']}<br>"
@@ -1313,9 +1473,10 @@ def debug():
         kind = {"local": "lokal", "ytdlp": "yt-dlp (Proxy)"}.get(
             it["kind"], "Web (Proxy)" if it.get("proxy") else "Web (direkt)")
         rows.append(
-            f"<tr><td>{html.escape(it['cat'])}</td><td>{kind}</td>"
+            f"<tr id='v{it['id']}'><td>{html.escape(it['cat'])}</td><td>{kind}</td>"
             f"<td>{html.escape(it['title'])}</td>"
-            f"<td>{screen} / {stereo}</td><td>{codec}</td>"
+            f"<td>{screen} / {stereo or 'mono'}{' (manuell)' if it['id'] in _formats else ''}<br>"
+            f"{format_select(it['id'])}</td><td>{codec}</td>"
             f"<td>{thumb_txt}</td><td>{w}</td>"
             f"<td><a href='/deovr/{it['id']}'>JSON</a></td></tr>")
 
@@ -1369,6 +1530,17 @@ def debug():
         "<p>Steht bei <b>Vorschaubild</b> gar nichts, fragt DeoVR die Bilder nicht ab (dann liegt es am "
         "Client, nicht an den Bildern). Stehen dort 200er, kommen die Bilder an.</p>")
 
+    with _requests_lock:
+        tl = list(reversed(_thumb_log))
+    thumb_rows = "".join(
+        f"<tr><td>{t}</td><td>{html.escape(ip)}</td><td>{html.escape(path)}</td><td>{code}</td>"
+        f"<td>{ms} ms</td><td>{html.escape(ua)}</td></tr>"
+        for t, ip, m, path, code, ua, rng, ms in tl)
+    stats_table += (
+        "<h3>Letzte Vorschaubild-Anfragen (ohne die Bilder dieser Diagnoseseite)</h3>"
+        "<table><tr><th>Zeit</th><th>Client</th><th>Pfad</th><th>Status</th><th>Dauer</th><th>User-Agent</th></tr>"
+        + (thumb_rows or "<tr><td colspan=6>noch keine</td></tr>") + "</table>")
+
     host = request.host.rsplit(":", 1)[0] if ":" in request.host else request.host
     hint = ""
     if not PUBLIC_URL and not host_is_ip(host):
@@ -1377,9 +1549,21 @@ def debug():
                 "Vorschaubilder und Videos starten nicht. Öffne die Bibliothek in DeoVR mit der IP "
                 "oder setze die Option <code>public_url</code>.")
     return (
-        "<meta charset='utf-8'><style>body{font-family:sans-serif}"
-        "td,th{border:1px solid #888;padding:4px 8px;vertical-align:top}"
-        "table{border-collapse:collapse}</style>"
+        "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>DeoVR Server – Diagnose</title><style>"
+        "body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:24px auto;max-width:1200px;"
+        "padding:0 16px;color:#1b1f24;background:#f6f8fa;line-height:1.5}"
+        "h2{margin-top:0}h3{margin:28px 0 8px}"
+        "table{border-collapse:collapse;width:100%;background:#fff;border-radius:8px;overflow:hidden;"
+        "box-shadow:0 1px 3px #0002;font-size:14px}"
+        "th{background:#24292f;color:#fff;text-align:left}"
+        "td,th{padding:6px 10px;vertical-align:top;border-bottom:1px solid #e3e6ea}"
+        "img.t{width:96px;border-radius:4px;display:block}"
+        "pre{background:#fff;padding:12px;border-radius:8px;overflow:auto}"
+        "code{background:#e8ecf0;padding:1px 5px;border-radius:4px}"
+        "@media(prefers-color-scheme:dark){body{background:#0d1117;color:#e6edf3}"
+        "table,pre{background:#161b22}td,th{border-color:#30363d}th{background:#21262d}"
+        "code{background:#30363d}a{color:#58a6ff}}</style>"
         f"<h2>Diagnose</h2><p><b>Version {VERSION}</b> · <a href='/selftest'>Selbsttest ausführen</a><br>"
         f"Vorschaubilder lokaler Videos: {_progress['done']} von {_progress['total']} bearbeitet, "
         f"{sum(1 for f in CACHE_DIR.glob('*.jpg'))} Bilder im Zwischenspeicher<br>"
@@ -1410,6 +1594,9 @@ if __name__ == "__main__":
     print(f"DeoVR-URL:  http://<deine-IP>:{PORT}/deovr")
     print(f"Diagnose:   http://localhost:{PORT}/debug")
     threading.Thread(target=pregenerate, daemon=True).start()
+    if THUMB_INLINE:
+        print("Vorschaubilder werden direkt in die Bibliothek eingebettet (thumb_inline)")
+        threading.Thread(target=inline_thumb_worker, daemon=True).start()
     if SOURCES:
         threading.Thread(target=refresh_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, threaded=True)
