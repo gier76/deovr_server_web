@@ -37,7 +37,7 @@ from flask import (Flask, Response, abort, jsonify, redirect, request,
                    send_file, stream_with_context)
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-VERSION = "1.3.0"
+VERSION = "1.5.3"
 VIDEO_DIR = Path(os.environ.get("VIDEO_DIR", "videos")).resolve()
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "cache")).resolve()
 PORT = int(os.environ.get("PORT", 8000))
@@ -74,9 +74,19 @@ _OPTS = _load_options()
 DEFAULT_FORMAT = (os.environ.get("DEFAULT_FORMAT") or _OPTS.get("default_format") or "").strip()
 AUTO_FORMAT = str(os.environ.get("AUTO_FORMAT", _OPTS.get("auto_format", True))).lower() not in ("0", "false", "no")
 THUMB_INLINE = str(os.environ.get("THUMB_INLINE", _OPTS.get("thumb_inline", False))).lower() in ("1", "true", "yes")
+THUMB_TEST = str(os.environ.get("THUMB_TEST", _OPTS.get("thumb_test", False))).lower() in ("1", "true", "yes")
+THUMB_TUNNEL = str(os.environ.get("THUMB_TUNNEL", _OPTS.get("thumb_tunnel", False))).lower() in ("1", "true", "yes")
+_tunnel = {"url": "", "status": "aus"}  # Adresse und Zustand des Quick-Tunnels
+HTTPS_URL = (os.environ.get("HTTPS_URL") or _OPTS.get("https_url") or "").strip().rstrip("/")
+SSL_CERT = (os.environ.get("SSL_CERT") or _OPTS.get("ssl_cert") or "/ssl/fullchain.pem").strip()
+SSL_KEY = (os.environ.get("SSL_KEY") or _OPTS.get("ssl_key") or "/ssl/privkey.pem").strip()
+HTTPS_PORT = int(os.environ.get("HTTPS_PORT", 8443))
+_https_state = {"status": "aus"}  # für /debug
 HIDE_BROKEN = str(os.environ.get("HIDE_BROKEN", _OPTS.get("hide_broken", True))).lower() not in ("0", "false", "no")
 # "json": Format steht in der JSON (DeoVR fixiert die Projektion). "filename": Format steht nur im
 # Dateinamen der Video-Adresse; DeoVR erkennt es daran und lässt die Projektion im Menü änderbar.
+MANUAL_CAT = bool(_OPTS.get("manual_category", True))
+MANUAL_NAME = "Format selbst wählen"
 FORMAT_MODE = (os.environ.get("FORMAT_MODE") or _OPTS.get("format_mode") or "json").strip().lower()
 
 # Auflösung/Länge von Webvideos merken (übersteht Neustarts): Item-ID -> {"w", "h", "dur"}
@@ -104,6 +114,7 @@ def meta_set(i, w, h, dur):
 
 
 app = Flask(__name__)
+app.json.sort_keys = False  # Felder in der Reihenfolge des Codes ausgeben, wie deovr.com
 # Hinter einem Reverse Proxy die Original-Adresse/Schema übernehmen
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 _probe_cache = {}
@@ -240,6 +251,29 @@ def set_format(i, fmt):
         print(f"[formats] konnte nicht speichern: {e}")
 
 
+_VR_ALONE = re.compile(r"(?<![A-Z0-9])VR(?![A-Z0-9])")
+
+
+def folder_format(it):
+    """Format aus den Ordnernamen unterhalb des Videoordners; der innerste Ordner mit Angabe gewinnt.
+    Liefert (Projektion, Stereo, ausdrücklich_2D). Ohne Angabe: ("flat", None, False)."""
+    if it.get("kind") != "local":
+        return "flat", None, False
+    try:
+        parts = it["path"].relative_to(VIDEO_DIR).parent.parts
+    except ValueError:
+        return "flat", None, False
+    for name in reversed(parts):
+        up = _VR_ALONE.sub("", name.upper())
+        toks = set(up.replace("-", "_").replace(" ", "_").replace(".", "_").split("_"))
+        screen, stereo = detect_format(up)
+        if screen != "flat" or stereo is not None:
+            return screen, stereo, False
+        if toks & {"2D", "FLAT", "MONO"}:
+            return "flat", None, True
+    return "flat", None, False
+
+
 def format_of(it):
     """Format: 1. Angaben im Namen, 2. Vorgabe 'format' der Quelle (bei lokalen Videos 'default_format'),
     3. automatisch aus der Bildgröße. 'format: auto' schaltet die Vorgabe ab."""
@@ -247,6 +281,14 @@ def format_of(it):
     if ov:
         return detect_format(ov)
     screen, stereo = detect_format(it["name"])
+    # Ordnername (z. B. "180_LR", "360_TB", "2D"): ergänzt, was der Dateiname offen lässt
+    f_screen, f_stereo, f_flat = folder_format(it)
+    if screen == "flat":
+        screen = f_screen
+    if stereo is None:
+        stereo = f_stereo
+    if f_flat and screen == "flat" and stereo is None:
+        return screen, stereo  # Ordner sagt ausdrücklich "2D": nichts erraten
     explicit = (it.get("fmt") or (DEFAULT_FORMAT if it["kind"] == "local" else "")).strip()
     if explicit.lower() == "auto":
         explicit = ""
@@ -321,6 +363,12 @@ def base_url():
     return request.host_url.rstrip("/")
 
 
+def thumb_base():
+    """Basisadresse für Vorschaubilder. DeoVR zeigt Bilder von http://-Adressen offenbar nicht an,
+    deshalb kann hier eine https://-Adresse (Option https_url) stehen."""
+    return HTTPS_URL or _tunnel["url"] or base_url()
+
+
 def numeric_id(i: str) -> int:
     """DeoVR erwartet in der Video-JSON eine Zahl als id (Beispiel der Doku: 123)."""
     return int(i[:7], 16)
@@ -358,9 +406,9 @@ def validate_detail(d: dict):
         p.append("videoLength ist keine Zahl")
     if not isinstance(d.get("is3d"), bool):
         p.append("is3d ist kein true/false")
-    if FORMAT_MODE != "filename" and d.get("screenType") not in ("flat", "dome", "sphere", "fisheye", "mkx200", "rf52"):
+    if FORMAT_MODE in ("json", "screen") and d.get("screenType") not in ("flat", "dome", "sphere", "fisheye", "mkx200", "rf52"):
         p.append("screenType unbekannt")
-    if d.get("is3d") and d.get("stereoMode") not in ("sbs", "tb", "cuv", "off"):
+    if FORMAT_MODE in ("json", "stereo") and d.get("is3d") and d.get("stereoMode") not in ("sbs", "tb", "cuv", "off"):
         p.append("stereoMode fehlt oder unbekannt")
     if not str(d.get("thumbnailUrl", "")).startswith("http"):
         p.append("thumbnailUrl fehlt")
@@ -666,6 +714,15 @@ def _thumb_from_page(it, out):
             return None
 
 
+def _vr_tile_crop(it):
+    """Bei VR-Videos mit quadratischem Einzelbild (z. B. ein Auge von 4320x2160) die Mitte als 16:9 nehmen:
+    so sieht das Vorschaubild aus wie ein Kachelbild und nicht wie ein verzerrter Halbkugel-Ausschnitt."""
+    screen, _ = format_of(it)
+    if screen == "flat":
+        return []
+    return ["crop=iw:if(lt(iw/ih\\,1.5)\\,trunc(iw*9/32)*2\\,ih)"]
+
+
 def make_thumb(it, slots=None):
     """Erzeugt ein Vorschaubild (bei 3D-Videos nur das linke/obere Auge)."""
     slots = slots or _thumb_slots
@@ -693,7 +750,7 @@ def make_thumb(it, slots=None):
             return None
         if it["kind"] == "local":
             probe(it)  # Bildgröße bekannt machen, damit das richtige Auge ausgeschnitten wird
-        vf = stereo_crop(it) + ["scale=640:-2"]
+        vf = stereo_crop(it) + _vr_tile_crop(it) + ["scale=640:-2"]
         local = it["kind"] == "local"
         try:
             target, headers = media_source(it)
@@ -714,7 +771,7 @@ def make_thumb(it, slots=None):
                     [FFMPEG, "-hide_banner", "-loglevel", "error", "-y",
                      *src_args, "-noaccurate_seek", "-ss", str(ts), "-i", target,
                      "-an", "-sn", "-frames:v", "1", "-vf", ",".join(vf),
-                     "-q:v", "3", str(out)],
+                     "-pix_fmt", "yuvj420p", "-q:v", "3", str(out)],
                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                     timeout=90 if not local else 60)
             except subprocess.TimeoutExpired:
@@ -1333,6 +1390,8 @@ def selftest():
 
 @app.route("/deovr", methods=["GET", "POST"])
 def deovr_library():
+    if THUMB_TEST:  # Test: /deovr liefert die kleine Testbibliothek, damit sie über die Domain geöffnet werden kann
+        return deovr_test()
     cats = {}
     for it in all_items():
         if HIDE_BROKEN and is_broken(it):
@@ -1342,14 +1401,49 @@ def deovr_library():
             "title": it["title"],
             "videoLength": (it.get("duration") or (_meta.get(it["id"]) or {}).get("dur")
                             or cached_probe(it)["duration"]),
-            "thumbnailUrl": (small_thumb_uri(it) if THUMB_INLINE else None) or f"{base_url()}{thumb_path(i)}",
             "video_url": f"{base_url()}/deovr/{i}",
+            "thumbnailUrl": (small_thumb_uri(it) if THUMB_INLINE else None) or f"{thumb_base()}{thumb_path(i)}",
         })
-    return jsonify({"scenes": [{"name": c, "list": l} for c, l in cats.items()]})
+    scenes = [{"name": c, "list": l} for c, l in cats.items()]
+    if MANUAL_CAT:
+        # Zweite Kategorie mit denselben Videos, aber ohne Formatvorgabe: dort bleibt DeoVRs eigener
+        # Projektions-Knopf, falls die Automatik daneben liegt.
+        allv = [dict(v, video_url=v["video_url"] + "_m") for l in cats.values() for v in l]
+        scenes.append({"name": MANUAL_NAME, "list": allv})
+    return jsonify({"scenes": scenes, "authorized": "1"})
+
+
+@app.route("/deovr-test")
+def deovr_test():
+    """Kleine Testbibliothek: dasselbe Video mit drei verschiedenen Arten von Vorschaubild.
+    Zeigt in DeoVR, welche davon angezeigt wird."""
+    it = next((x for x in all_items()
+               if (CACHE_DIR / f"{x['id']}.jpg").exists() and not is_broken(x)), None)
+    if not it:
+        return jsonify({"scenes": [{"name": "Test", "list": []}], "authorized": "1"})
+    make_small_thumb(it)
+    base = {"videoLength": (cached_probe(it)["duration"] or 60), "video_url": f"{base_url()}/deovr/{it['id']}"}
+    items = [
+        dict(base, title="TEST 1 - Bild per HTTP vom Add-on", thumbnailUrl=f"{base_url()}/thumb/{it['id']}.jpg"),
+        *([dict(base, title="TEST 4 - Bild per HTTPS vom Add-on",
+                thumbnailUrl=f"{HTTPS_URL}/thumb/{it['id']}.jpg")] if HTTPS_URL else []),
+        dict(base, title="TEST 2 - Bild eingebettet (data-URI)",
+             thumbnailUrl=small_thumb_uri(it) or f"{base_url()}/thumb/{it['id']}.jpg"),
+        dict(base, title="TEST 5 - JPEG per HTTP aus dem Internet",
+             thumbnailUrl="http://httpbin.org/image/jpeg"),
+        dict(base, title="TEST 6 - JPEG per HTTPS aus dem Internet",
+             thumbnailUrl="https://httpbin.org/image/jpeg"),
+        dict(base, title="TEST 3 - Bild per HTTPS aus dem Internet",
+             thumbnailUrl="https://www.google.com/images/branding/googlelogo/1x/googlelogo_color_272x92dp.png"),
+    ]
+    return jsonify({"scenes": [{"name": "Thumbnail-Test", "list": items}], "authorized": "1"})
 
 
 @app.route("/deovr/<i>")
 def deovr_video(i):
+    manual = i.endswith("_m")
+    if manual:
+        i = i[:-2]
     it = find_item(i)
     if not it:
         abort(404)
@@ -1366,17 +1460,18 @@ def deovr_video(i):
         info = cached_probe(it)
     screen, stereo = format_of(it)  # erst jetzt: die Bildgröße ist nun bekannt
 
-    flags = filename_flags(screen, stereo) if FORMAT_MODE == "filename" else ""
+    mode = "none" if manual else FORMAT_MODE
+    flags = filename_flags(screen, stereo) if mode in ("filename", "title") else ""
     if it["kind"] == "remote" and not it["proxy"]:
         url = it["url"]  # direkter Link zur Originaldatei
     else:
         url = f"{base_url()}/video/{i}{flags}{it['ext']}"
 
-    thumb_url = f"{base_url()}{thumb_path(i)}"
+    thumb_url = f"{thumb_base()}{thumb_path(i)}"
     video_source = {"resolution": info["height"], "url": url}
     data = {
-        "id": numeric_id(i),
-        "title": it["title"],
+        "id": numeric_id(i) + (100000000 if manual else 0),
+        "title": it["title"] + (flags if mode == "title" else ""),
         "authorized": 1,
         "videoLength": int(info["duration"] or 0),
         "skipIntro": 0,
@@ -1391,8 +1486,9 @@ def deovr_video(i):
             "videoSources": [video_source],
         }],
     }
-    if FORMAT_MODE != "filename":
+    if mode in ("json", "screen"):
         data["screenType"] = screen
+    if mode in ("json", "stereo"):
         data["stereoMode"] = stereo or "off"
     _last_detail[:] = [json.dumps(data, indent=1, ensure_ascii=False)]
     return jsonify(data)
@@ -1426,6 +1522,26 @@ def thumb(i):
     if not out:
         abort(404)
     return send_file(out, mimetype="image/jpeg", max_age=86400)
+
+
+FORMAT_MODES = [
+    ("json", "json: screenType + stereoMode im JSON (Erkennung verbindlich, DeoVR-Knopf meist weg)"),
+    ("filename", "filename: Kürzel in der Video-Adresse"),
+    ("title", "title: Kürzel im Titel + in der Video-Adresse"),
+    ("screen", "screen: nur screenType im JSON"),
+    ("stereo", "stereo: nur stereoMode im JSON"),
+    ("none", "none: gar nichts senden (nur DeoVR-Menü)"),
+]
+
+
+@app.route("/setmode")
+def setmode():
+    global FORMAT_MODE
+    m = request.args.get("m", "")
+    if m not in {c for c, _ in FORMAT_MODES}:
+        abort(400)
+    FORMAT_MODE = m
+    return redirect("/debug")
 
 
 @app.route("/setformat")
@@ -1567,6 +1683,14 @@ def debug():
         f"<h2>Diagnose</h2><p><b>Version {VERSION}</b> · <a href='/selftest'>Selbsttest ausführen</a><br>"
         f"Vorschaubilder lokaler Videos: {_progress['done']} von {_progress['total']} bearbeitet, "
         f"{sum(1 for f in CACHE_DIR.glob('*.jpg'))} Bilder im Zwischenspeicher<br>"
+        f"Vorschaubild-Tunnel (thumb_tunnel): {html.escape(_tunnel['status'])}"
+        f"{' – ' + html.escape(_tunnel['url']) if _tunnel['url'] else ''}<br>"
+        f"HTTPS für Vorschaubilder: {html.escape(HTTPS_URL) + ' – ' + html.escape(_https_state['status']) if HTTPS_URL else 'nicht eingerichtet (Option https_url)'}<br>"
+        "Format-Übergabe an DeoVR (Test, gilt bis zum Neustart; danach Bibliothek in DeoVR neu laden): "
+        "<select onchange=\"location='/setmode?m='+this.value\">"
+        + "".join(f"<option value='{v}'{' selected' if v == FORMAT_MODE else ''}>{html.escape(t)}</option>"
+                  for v, t in FORMAT_MODES)
+        + "</select><br>"
         f"VR-Format automatisch erkennen: {'ja' if AUTO_FORMAT else 'nein'}"
         f"{', Standardformat lokal: ' + html.escape(DEFAULT_FORMAT) if DEFAULT_FORMAT else ''}<br>"
         f"ffmpeg: {FFMPEG or 'NICHT GEFUNDEN'}<br>"
@@ -1582,6 +1706,73 @@ def debug():
         + html.escape(_last_detail[0] if _last_detail else "noch keine Anfrage") + "</pre>")
 
 
+_TUNNEL_RE = re.compile(r"https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com")
+THUMB_PORT = int(os.environ.get("THUMB_PORT", 8001))
+
+
+def build_thumb_app():
+    """Eigene kleine App, die NUR Vorschaubilder ausliefert. Nur sie wird durch den Tunnel erreichbar,
+    nie die Bibliothek, Videos oder die Diagnoseseite."""
+    t = Flask("thumbs")
+    t.add_url_rule("/thumb/<v>/<i>.jpg", view_func=thumb_versioned)
+    t.add_url_rule("/thumb/<i>.jpg", view_func=thumb)
+    t.before_request(start_timer)
+    t.after_request(log_request)
+    return t
+
+
+def run_tunnel():
+    """Startet einen Cloudflare-Quick-Tunnel zur Vorschaubild-App und übernimmt dessen https-Adresse."""
+    exe = shutil.which("cloudflared")
+    if not exe:
+        _tunnel["status"] = "FEHLER: cloudflared nicht installiert (Add-on neu bauen, siehe Doku)"
+        print("[tunnel] " + _tunnel["status"])
+        return
+    from werkzeug.serving import make_server
+    try:
+        srv = make_server("127.0.0.1", THUMB_PORT, build_thumb_app(), threaded=True)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    except OSError as e:
+        _tunnel["status"] = f"FEHLER: Port {THUMB_PORT} nicht frei ({e})"
+        print("[tunnel] " + _tunnel["status"])
+        return
+    while True:
+        _tunnel["url"], _tunnel["status"] = "", "startet ..."
+        try:
+            proc = subprocess.Popen([exe, "tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{THUMB_PORT}"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in proc.stdout:
+                m = _TUNNEL_RE.search(line)
+                if m and not _tunnel["url"]:
+                    _tunnel["url"], _tunnel["status"] = m.group(0), "läuft"
+                    print(f"[tunnel] läuft: {_tunnel['url']}")
+            proc.wait()
+            _tunnel["status"] = f"beendet (Code {proc.returncode}), neuer Versuch in 30 s"
+        except Exception as e:
+            _tunnel["status"] = f"FEHLER: {e}, neuer Versuch in 30 s"
+        print("[tunnel] " + _tunnel["status"])
+        _tunnel["url"] = ""
+        time.sleep(30)
+
+
+def start_https():
+    """Zweiter Server mit TLS, nur für Vorschaubilder (und alles andere, falls gewünscht).
+    Braucht ein gültiges Zertifikat für den Namen in https_url, z. B. vom DuckDNS-Add-on in /ssl."""
+    try:
+        if not (Path(SSL_CERT).exists() and Path(SSL_KEY).exists()):
+            _https_state["status"] = f"FEHLER: Zertifikat nicht gefunden ({SSL_CERT} / {SSL_KEY})"
+            print("[https] " + _https_state["status"])
+            return
+        from werkzeug.serving import make_server
+        srv = make_server("0.0.0.0", HTTPS_PORT, app, threaded=True, ssl_context=(SSL_CERT, SSL_KEY))
+        _https_state["status"] = f"läuft auf Port {HTTPS_PORT}"
+        print(f"[https] {_https_state['status']}, Adresse in den JSONs: {HTTPS_URL}")
+        srv.serve_forever()
+    except Exception as e:
+        _https_state["status"] = f"FEHLER: {e}"
+        print(f"[https] {_https_state['status']}")
+
+
 if __name__ == "__main__":
     print(f"DeoVR-Server Version {VERSION}")
     print(f"Videos aus: {VIDEO_DIR}")
@@ -1593,10 +1784,21 @@ if __name__ == "__main__":
         print(f"Öffentliche Basis-URL: {PUBLIC_URL}")
     print(f"DeoVR-URL:  http://<deine-IP>:{PORT}/deovr")
     print(f"Diagnose:   http://localhost:{PORT}/debug")
+    THUMB_REV = "2"  # erhöhen, wenn sich das Aussehen der Vorschaubilder ändert: alte werden neu erzeugt
+    _rev_file = CACHE_DIR / "thumb_rev"
+    if not _rev_file.exists() or _rev_file.read_text().strip() != THUMB_REV:
+        for f in list(CACHE_DIR.glob("*.jpg")) + list(CACHE_DIR.glob("*.small.jpeg")):
+            f.unlink(missing_ok=True)
+        _rev_file.write_text(THUMB_REV)
+        print("Vorschaubilder werden neu erzeugt (neues Format)")
     threading.Thread(target=pregenerate, daemon=True).start()
     if THUMB_INLINE:
         print("Vorschaubilder werden direkt in die Bibliothek eingebettet (thumb_inline)")
         threading.Thread(target=inline_thumb_worker, daemon=True).start()
     if SOURCES:
         threading.Thread(target=refresh_loop, daemon=True).start()
+    if HTTPS_URL:
+        threading.Thread(target=start_https, daemon=True).start()
+    elif THUMB_TUNNEL:
+        threading.Thread(target=run_tunnel, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, threaded=True)

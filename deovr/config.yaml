@@ -1,5 +1,5 @@
 name: "DeoVR Server"
-version: "1.3.0"
+version: "1.5.3"
 slug: deovr_server_web
 description: "Eigene VR-Videos, Webseiten und yt-dlp-Quellen im DeoVR-Format streamen (Meta Quest)"
 arch:
@@ -10,12 +10,15 @@ boot: auto
 init: false
 ports:
   8000/tcp: 8000
+  8443/tcp: 8443
 ports_description:
   8000/tcp: "DeoVR-Server (Bibliothek unter /deovr)"
+  8443/tcp: "HTTPS für Vorschaubilder (nur mit Option https_url)"
 webui: "http://[HOST]:[PORT:8000]/debug"
 map:
   - media:rw
   - share:rw
+  - ssl:ro
 options:
   video_dir: "/media/deovr"
   update_ytdlp: true
@@ -28,7 +31,13 @@ schema:
   auto_format: bool?
   thumb_inline: bool?
   hide_broken: bool?
-  format_mode: list(json|filename)?
+  thumb_test: bool?
+  thumb_tunnel: bool?
+  https_url: str?
+  ssl_cert: str?
+  ssl_key: str?
+  manual_category: bool?
+  format_mode: list(json|filename|title|screen|stereo|none)?
   update_ytdlp: bool?
   sources:
     - name: str

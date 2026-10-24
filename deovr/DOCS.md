@@ -75,6 +75,46 @@ Die Quellen werden beim Start und danach alle 30 Minuten neu eingelesen. Über `
 - `hide_broken`: Lokale Dateien, die ffprobe nicht lesen kann (defekt, unvollständig), in DeoVR ausblenden (Standard `true`). Auf `/debug` stehen sie weiter.
 - `default_format`: Format für lokale Videos, deren Name keinen Hinweis enthält, z. B. `180_LR`. Leer lassen, wenn die automatische Erkennung entscheiden soll.
 
+## Format: Automatik und manuelles Umstellen
+DeoVR blendet den Projektions-Knopf aus, sobald das JSON dafür eine Vorgabe enthält. Automatik und DeoVR-Knopf im selben Eintrag gehen deshalb nicht zusammen (getestet mit 15.9.3915). Das Add-on löst das mit zwei Kategorien: Die normalen Kategorien enthalten die Videos mit automatisch erkanntem Format. Die Kategorie **"Format selbst wählen"** (Option `manual_category`, Standard an) enthält dieselben Videos ohne Formatvorgabe, dort stellst du Projektion und 3D-Modus in DeoVR selbst ein. Liegt die Automatik daneben, öffnest du das Video dort.
+
+### Weitere Übergabe-Varianten (Option `format_mode`)
+Seit 1.5.1 gilt `format_mode: filename` als Standard. Das Add-on erkennt das Format weiter automatisch (Dateiname, Ordnername, Quelle, Bildgröße) und schreibt es als Kürzel in die Video-Adresse, z. B. `/video/<id>_180_LR.mp4`. DeoVR liest das Kürzel selbst und behält dabei seinen **eigenen Projektions-Knopf**. Stimmt die Erkennung nicht, stellst du das Format direkt in DeoVR um. Alternativ setzt du es dauerhaft pro Video auf `/debug`.
+
+Welche Übergabe bei dir funktioniert, hängt von der DeoVR-Version ab. Auf `/debug` steht oben ein Auswahlfeld "Format-Übergabe an DeoVR", mit dem du die Varianten ohne Neustart durchprobieren kannst (danach die Bibliothek in DeoVR neu laden). Die Wahl gilt bis zum Neustart; dauerhaft setzt du sie mit `format_mode`. Varianten: `json`, `filename`, `title` (Kürzel zusätzlich im Titel), `screen` (nur screenType), `stereo` (nur stereoMode), `none`.
+
+`format_mode: json` schickt das Format stattdessen fest im JSON (`screenType`/`stereoMode`). Dann ist die Erkennung verbindlich, aber DeoVR blendet seinen Projektions-Knopf aus.
+
+## Vorschaubilder per Tunnel (Option `thumb_tunnel`)
+Der einfachste Weg zu Vorschaubildern in DeoVR, ohne Domain und Zertifikat (mit DeoVR 15.9.3915 auf der Meta Quest getestet, die Bilder erscheinen): Das Add-on startet beim Start einen **Cloudflare-Quick-Tunnel** und liefert die Vorschaubilder darüber per HTTPS aus. Die Adresse (`https://<zufällige-wörter>.trycloudflare.com`) trägt das Add-on selbst in die Bibliothek ein. Auf `/debug` steht, ob der Tunnel läuft.
+
+```yaml
+thumb_tunnel: true
+```
+
+Wichtig zu wissen:
+- Nur die Vorschaubilder sind über den Tunnel erreichbar, nie die Bibliothek, die Videos oder `/debug`. Dafür läuft intern eine eigene kleine Server-Instanz (Port 8001, nicht veröffentlicht).
+- Die Bilder laufen über das Internet und über Cloudflare. Die Adresse ist zufällig und nicht erratbar, aber öffentlich erreichbar, und die Bild-Adressen enthalten Video-IDs. Wenn dir das bei deinen Inhalten nicht passt, lass die Option aus.
+- Quick-Tunnel sind ein kostenloser Testdienst ohne Verfügbarkeitszusage. Fällt er aus, fehlen nur die Bilder. Die Adresse ändert sich bei jedem Neustart des Add-ons.
+- Beim Bauen des Add-ons wird `cloudflared` von GitHub geladen (rund 40 MB). Nach dem Update muss das Add-on neu gebaut werden. Für `amd64` und `aarch64`.
+- Setzt du zusätzlich `https_url`, hat diese Vorrang und der Tunnel startet nicht.
+
+## HTTPS für Vorschaubilder (Option `https_url`)
+DeoVR zeigt Vorschaubilder offenbar nur an, wenn sie per **HTTPS mit gültigem Zertifikat** geladen werden (Bilder von `http://`-Adressen erscheinen nicht, ein HTTPS-Bild aus dem Internet schon). Die Videos laufen auch über HTTP. Für die Bilder kann das Add-on deshalb zusätzlich einen HTTPS-Server auf Port 8443 starten.
+
+Voraussetzungen:
+1. Ein Name mit gültigem Zertifikat, z. B. von einem Let's-Encrypt-Add-on (DuckDNS) für Home Assistant. Das Zertifikat liegt dann unter `/ssl/fullchain.pem` und `/ssl/privkey.pem`. Das Add-on bindet `/ssl` schreibgeschützt ein.
+2. Dieser Name muss im Heimnetz auf die IP von Home Assistant zeigen (z. B. ein Eintrag im lokalen DNS oder Router), sonst erreicht die Quest ihn nicht oder landet an der falschen Adresse.
+3. Port 8443 muss im Heimnetz erreichbar sein.
+
+Optionen:
+```yaml
+https_url: https://deinname.duckdns.org:8443
+ssl_cert: /ssl/fullchain.pem   # optional, das ist der Standard
+ssl_key: /ssl/privkey.pem      # optional, das ist der Standard
+```
+Mit gesetzter `https_url` verweisen alle `thumbnailUrl` in der Bibliothek und in der Video-JSON darauf. Auf `/debug` steht, ob der HTTPS-Server läuft oder woran es scheitert. Nach einer Erneuerung des Zertifikats das Add-on neu starten. Mit `thumb_test: true` zeigt die Testbibliothek einen zusätzlichen Eintrag „TEST 4“ mit Bild per HTTPS vom Add-on.
+
 ## Format über den Dateinamen
 | Namensteil | Bedeutung |
 |---|---|
@@ -95,6 +135,17 @@ Steht im Namen nichts und gibt es keine feste Vorgabe, schaut das Add-on auf die
 | anderes | | flach |
 
 Das ist eine Faustregel. Ein 2:1-Video kann auch ein 360°-Video in Mono sein. Dann den Namen mit `360` ergänzen oder `format` setzen. Bei Webquellen ist die Bildgröße erst nach dem Auflösen im Hintergrund bekannt, auf `/debug` steht pro Video das erkannte Format. Mit `auto_format: false` wird nichts geraten.
+
+### Format aus dem Ordnernamen
+Lokale Videos erben das Format von ihren Ordnern unterhalb des Videoordners, ohne dass du sie umbenennen musst:
+
+```
+media/deovr/180_LR/urlaub.mp4        -> 180° Side-by-Side
+media/deovr/VR/360_TB/Sub/film.mp4   -> 360° Top-Bottom (der innerste Ordner mit Angabe gewinnt)
+media/deovr/2D/film.mp4              -> flach, es wird nichts geraten
+```
+
+Erkannt werden dieselben Teile wie im Dateinamen (`180`, `360`, `LR`, `SBS`, `TB`, `OU`, `FISHEYE`, `MKX200`), dazu `2D`, `FLAT` oder `MONO` für ausdrücklich flach. Reihenfolge: **von Hand in `/debug` gewählt** > Dateiname > Ordnername > `default_format` > automatische Erkennung aus der Bildgröße. Die Auswahl in `/debug` bleibt also immer möglich und gewinnt.
 
 ### Format von Hand einstellen
 Auf `/debug` hat jedes Video in der Tabelle „Videos“ ein Auswahlfeld unter dem erkannten Format (automatisch, 2D, 180°/360° als Side-by-Side, Top-Bottom oder Mono, Fisheye …). Die Wahl gilt sofort und hat Vorrang vor Dateiname, Quellen-Vorgabe und Auto-Erkennung. Sie wird gespeichert und übersteht Neustarts. „automatisch“ nimmt sie zurück. In DeoVR die Bibliothek danach neu öffnen.

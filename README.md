@@ -4,7 +4,7 @@
 
 **Eigene VR-Videos und Webquellen im DeoVR-Format – als Home-Assistant-Add-on für die Meta Quest**
 
-[![Add-on-Repository hinzufügen](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FDEIN-NAME%2Fdeovr-ha-addon)
+[![Add-on-Repository hinzufügen](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fgier76%2Fdeovr_server_web)
 ![Architekturen](https://img.shields.io/badge/arch-amd64%20%7C%20aarch64-blue)
 ![Lizenz](https://img.shields.io/badge/Lizenz-MIT-green)
 
@@ -38,7 +38,7 @@ Die Diagnoseseite (`/debug`, im Add-on über „Web-UI öffnen“) mit erkannten
 ### Als Add-on-Repository (empfohlen)
 
 1. In Home Assistant: **Einstellungen → Add-ons → Add-on-Store → ⋮ → Repositories**
-2. `https://github.com/DEIN-NAME/deovr-ha-addon` hinzufügen (oder oben auf den Badge klicken)
+2. `https://github.com/gier76/deovr_server_web` hinzufügen (oder oben auf den Badge klicken)
 3. **DeoVR Server** installieren und starten
 4. Videos nach `media/deovr` legen (z. B. über die Samba-Freigabe)
 5. In DeoVR auf der Quest öffnen: `http://<HA-IP>:8000/deovr`
@@ -83,6 +83,14 @@ Alle Optionen stehen in [`deovr/DOCS.md`](deovr/DOCS.md).
 | `TB` / `OU` | Top-Bottom (3D) |
 
 Fehlt jeder Hinweis, entscheidet die Bildgröße (ab 2880 Pixel Breite): etwa 2:1 → 180° SBS, etwa 1:1 → 360° TB. Das ist eine Faustregel; ein 2:1-Video kann auch 360° Mono sein. Für sichere Ergebnisse `default_format` bzw. `format` setzen.
+
+## Vorschaubilder und HTTPS
+
+DeoVR (getestet mit 15.9.3915) zeigt Vorschaubilder nur von gültigem HTTPS an; Bilder von `http://`-Adressen, auch im LAN, werden nicht geladen.
+
+**Einfachster Weg, ohne Domain und Zertifikat:** `thumb_tunnel: true`. Das Add-on startet einen Cloudflare-Quick-Tunnel und liefert nur die Vorschaubilder darüber per HTTPS aus. Die Videos bleiben im LAN. Mit dieser Option sind die Vorschaubilder in DeoVR auf der Quest getestet und erscheinen. Datenschutz-Hinweis in der [Doku](deovr/DOCS.md) beachten: Die Bilder sind über eine zufällige, aber öffentliche Adresse erreichbar.
+
+**Alternative mit eigener Domain:** zusätzlicher HTTPS-Server auf Port 8443 (Option `https_url`, Zertifikat aus `/ssl`). Einrichtung: [`deovr/DOCS.md`](deovr/DOCS.md).
 
 ## Diagnose
 
