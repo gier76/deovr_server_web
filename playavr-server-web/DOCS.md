@@ -1,6 +1,7 @@
-# DeoVR Server
+# PlayaVR Server
 
-Streamt deine eigenen Videos und Videos von Webseiten an DeoVR (Meta Quest) im DeoVR-JSON-Format.
+Streamt deine eigenen Videos und Videos von Webseiten an Playa und DeoVR (Meta Quest).
+Die Bibliothek liefert Playa über die Playa API v2 und DeoVR über `/deovr`.
 
 ## Lokale Videos
 Standardordner: `/media/deovr` (in HA unter *Medien* / Samba-Freigabe `media/deovr`).

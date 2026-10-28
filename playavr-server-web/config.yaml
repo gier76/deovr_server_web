@@ -1,7 +1,7 @@
-name: "DeoVR Server"
-version: "1.5.3"
-slug: deovr_server_web
-description: "Eigene VR-Videos, Webseiten und yt-dlp-Quellen im DeoVR-Format streamen (Meta Quest)"
+name: "PlayaVR Server"
+version: "2.0.0"
+slug: playavr-server-web
+description: "Eigene VR-Videos, Webseiten und yt-dlp-Quellen für Playa und DeoVR streamen (Meta Quest)"
 arch:
   - amd64
   - aarch64
@@ -12,7 +12,7 @@ ports:
   8000/tcp: 8000
   8443/tcp: 8443
 ports_description:
-  8000/tcp: "DeoVR-Server (Bibliothek unter /deovr)"
+  8000/tcp: "Video-Server (Playa API v2; DeoVR-Bibliothek unter /deovr)"
   8443/tcp: "HTTPS für Vorschaubilder (nur mit Option https_url)"
 webui: "http://[HOST]:[PORT:8000]/debug"
 map:

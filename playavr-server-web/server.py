@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Selbstgehosteter DeoVR-Server (v4).
+Selbstgehosteter Video-Server für Playa & DeoVR (v4).
 
 Quellen:
   1. Lokale Videos:  videos/<Kategorie>/<video>.mp4  (Unterordner = Kategorien)
@@ -33,7 +33,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
-from flask import (Flask, Response, abort, jsonify, redirect, request,
+from flask import (Blueprint, Flask, Response, abort, jsonify, redirect, request,
                    send_file, stream_with_context)
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -1287,8 +1287,9 @@ def log_request(resp):
 
 @app.route("/")
 def index():
-    return (f"<h1>DeoVR-Server läuft</h1><p>Version {VERSION}</p>"
+    return (f"<h1>PlayaVR Server läuft</h1><p>Version {VERSION}</p>"
             f"<p>In DeoVR öffnen: <code>{base_url()}/deovr</code></p>"
+            f"<p>In Playa verbinden: <code>{base_url()}</code> (Playa API v2)</p>"
             f"<p><a href='/debug'>Diagnose</a> · <a href='/selftest'>Selbsttest</a></p>")
 
 
@@ -1666,7 +1667,7 @@ def debug():
                 "oder setze die Option <code>public_url</code>.")
     return (
         "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>DeoVR Server – Diagnose</title><style>"
+        "<title>PlayaVR Server – Diagnose</title><style>"
         "body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:24px auto;max-width:1200px;"
         "padding:0 16px;color:#1b1f24;background:#f6f8fa;line-height:1.5}"
         "h2{margin-top:0}h3{margin:28px 0 8px}"
@@ -1773,8 +1774,180 @@ def start_https():
         print(f"[https] {_https_state['status']}")
 
 
+# ---------------------------------------------------------------- Playa API (PlayaVR-App)
+# Die Playa-App verbindet http://<server> und erwartet dort GET /api/playa/v2/... im Rsp-Format
+# ({"status": {"code": 1}, "data": ...}). Authentifizierung ist abgeschaltet (config auth false),
+# die App fragt dann kein Profil und keine Codes ab. Gespielt wird über die bestehenden
+# /video/...-Adressen (Range-Anfragen werden bedient), Vorschaubilder über /thumb/...
+PLAYA_API_VERSION = "1.14"
+PLAYA_SITE_NAME = os.environ.get("PLAYA_SITE_NAME", "PlayaVR Server")
+
+_PLAYA_SCREEN = {"flat": "FLT", "dome": "180", "sphere": "360",
+                 "fisheye": "FSH", "mkx200": "FSH", "rf52": "FSH"}
+_PLAYA_STEREO = {"sbs": "LR", "tb": "TB"}
+
+
+def playa_rsp(data=None, code=1, message=""):
+    """Antwort im Playa-Format Rsp<T>. code=1 ist Ok; Fehlercodes wie 404 stehen im JSON, HTTP bleibt 200."""
+    rsp = {"status": {"code": code}}
+    if message:
+        rsp["status"]["message"] = message  # type: ignore[assignment]
+    if data is not None:
+        rsp["data"] = data
+    return jsonify(rsp)
+
+
+def playa_quality(h):
+    """(Name, Ordnung) nach Videohöhe; Playa sortiert Listen nach Ordnung (höher = besser)."""
+    for hh, name, order in ((4320, "8K+", 85), (3840, "7K", 75), (2880, "6K", 65),
+                            (2560, "5K", 55), (2160, "4K", 45), (1920, "3K", 35),
+                            (1440, "2K", 28), (1080, "1080p", 25)):
+        if h >= hh:
+            return name, order
+    return "720p", 15
+
+
+def playa_duration(it):
+    """Länge in Sekunden, ohne neuen ffprobe-Lauf (Wert aus dem Probe-Cache oder der Liste)."""
+    if it["kind"] == "ytdlp":
+        r = _resolve_cache.get(it["id"]) or {}
+        m = _meta.get(it["id"]) or {}
+        d = r.get("duration") or m.get("dur") or it.get("duration")
+    else:
+        d = cached_probe(it).get("duration")
+    return int(d or 0)
+
+
+def playa_release(it):
+    """Datum in Unix-Sekunden: Dateizeit bei lokalen Videos, sonst die jetzige Zeit."""
+    if it["kind"] == "local":
+        try:
+            return int(it["path"].stat().st_mtime)
+        except OSError:
+            pass
+    return int(time.time())
+
+
+def playa_cat(it):
+    return it.get("cat") or "Alle Videos"
+
+
+def playa_link(it):
+    """Ein VideoLinkView: Projektion/Stereo aus DeoVRs Format-Erkennung, Qualität aus der Höhe."""
+    screen, stereo = format_of(it)
+    dims = item_dims(it)
+    qname, qord = playa_quality(dims[1] if dims else 0)
+    return {"is_stream": True, "is_download": False,
+            "url": f"{base_url()}/video/{it['id']}{it.get('ext', '.mp4')}",
+            "projection": _PLAYA_SCREEN.get(screen, "FLT"),
+            "stereo": _PLAYA_STEREO.get(stereo or "", "MN"),
+            "quality_name": qname, "quality_order": qord}
+
+
+def playa_video(it, full=False):
+    """VideoListView (in /videos) oder VideoView (in /video/<id>) nach Playa-Schema."""
+    cat = playa_cat(it)
+    v = {"id": it["id"], "title": it["title"], "subtitle": cat,
+         "release_date": playa_release(it),
+         "preview_image": f"{thumb_base()}{thumb_path(it['id'])}",
+         "details": [{"type": "full", "duration_seconds": playa_duration(it),
+                      "transparency_mode": 0, "has_scripts": False}],
+         "links": [playa_link(it)]}
+    if full:
+        v["description"] = ""
+        v["categories"] = [{"id": cat, "title": cat}]
+        v["has_scripts"] = False
+    return v
+
+
+def playa_categories():
+    cats = {playa_cat(it) for it in all_items()
+            if not (HIDE_BROKEN and is_broken(it))}
+    return [{"id": c, "title": c} for c in sorted(cats)]
+
+
+def playa_paged(items):
+    """Seite nach Playa-Convention: page-index (0-based) und page-size, maximal 100 pro Seite."""
+    try:
+        page = max(int(request.args.get("page-index", 0)), 0)
+        size = min(max(int(request.args.get("page-size", 20)), 1), 100)
+    except ValueError:
+        abort(400)
+        return playa_rsp([], 400)  # unreachable (abort raises), beruhigt den Typ-Checker
+    return playa_rsp(items[page * size:(page + 1) * size])
+
+
+playa_bp = Blueprint("playa", __name__, url_prefix="/api/playa/v2")
+
+
+@playa_bp.get("/version")
+def playa_version():
+    return playa_rsp(PLAYA_API_VERSION)
+
+
+@playa_bp.get("/config")
+def playa_config():
+    return playa_rsp({"site_name": PLAYA_SITE_NAME, "actors": False, "categories": True,
+                      "categories_groups": False, "studios": False, "analytics": False,
+                      "scripts": False, "masks": False, "auth": False, "nsfw": False,
+                      "ar": False, "auth_by_code": False})
+
+
+@playa_bp.get("/categories")
+def playa_categories_route():
+    return playa_rsp(playa_categories())
+
+
+@playa_bp.get("/categories-groups")
+def playa_categories_groups():
+    return playa_rsp([])
+
+
+@playa_bp.get("/video-statuses")
+def playa_video_statuses():
+    return playa_rsp([])
+
+
+@playa_bp.get("/videos")
+def playa_videos():
+    items = all_items()
+    if HIDE_BROKEN:
+        items = [it for it in items if not is_broken(it)]
+    title = (request.args.get("title") or "").lower()
+    if title:
+        items = [it for it in items if title in it["title"].lower()]
+    inc = {c for c in (request.args.get("included-categories") or "").split(",") if c}
+    exc = {c for c in (request.args.get("excluded-categories") or "").split(",") if c}
+    if inc:
+        items = [it for it in items if playa_cat(it) in inc]
+    if exc:
+        items = [it for it in items if playa_cat(it) not in exc]
+    order = request.args.get("order", "title")
+    key = (lambda it: playa_release(it)) if order == "release_date" else \
+          (lambda it: it["title"].lower())
+    items.sort(key=key, reverse=request.args.get("direction", "asc") == "desc")
+    return playa_paged([playa_video(it) for it in items])
+
+
+@playa_bp.get("/video/<vid>")
+def playa_video_detail(vid):
+    it = find_item(vid)
+    if not it:
+        return playa_rsp(None, 404, "Video nicht gefunden")
+    return playa_rsp(playa_video(it, full=True))
+
+
+@playa_bp.get("/studios")
+@playa_bp.get("/actors")
+def playa_studios_actors():
+    return playa_paged([])  # in config abgeschaltet; die App fragt diese Liste nicht ab
+
+
+app.register_blueprint(playa_bp)
+
+
 if __name__ == "__main__":
-    print(f"DeoVR-Server Version {VERSION}")
+    print(f"PlayaVR Server Version {VERSION}")
     print(f"Videos aus: {VIDEO_DIR}")
     print(f"ffmpeg:  {FFMPEG or 'NICHT GEFUNDEN'}")
     print(f"ffprobe: {FFPROBE or 'NICHT GEFUNDEN'}")
@@ -1783,6 +1956,7 @@ if __name__ == "__main__":
     if PUBLIC_URL:
         print(f"Öffentliche Basis-URL: {PUBLIC_URL}")
     print(f"DeoVR-URL:  http://<deine-IP>:{PORT}/deovr")
+    print(f"Playa-URL:  http://<deine-IP>:{PORT}  (Playa API v2, ohne Pfad)")
     print(f"Diagnose:   http://localhost:{PORT}/debug")
     THUMB_REV = "2"  # erhöhen, wenn sich das Aussehen der Vorschaubilder ändert: alte werden neu erzeugt
     _rev_file = CACHE_DIR / "thumb_rev"

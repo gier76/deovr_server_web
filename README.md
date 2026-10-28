@@ -1,14 +1,14 @@
 <div align="center">
 
-# 🥽 DeoVR Server
+# 🥽 PlayaVR Server
 
-**Eigene VR-Videos und Webquellen im DeoVR-Format – als Home-Assistant-Add-on für die Meta Quest**
+**Eigene VR-Videos und Webquellen für Playa und DeoVR – als Home-Assistant-Add-on für die Meta Quest**
 
-[![Add-on-Repository hinzufügen](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fgier76%2Fdeovr_server_web)
+[![Add-on-Repository hinzufügen](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fgier76%2Fplayavr-server-web)
 ![Architekturen](https://img.shields.io/badge/arch-amd64%20%7C%20aarch64-blue)
 ![Lizenz](https://img.shields.io/badge/Lizenz-MIT-green)
 
-*Self-hosted video library for [DeoVR](https://deovr.com) (Meta Quest), served as a Home Assistant add-on: local files, web pages and yt-dlp sources, automatic VR projection detection, built-in diagnostics.*
+*Self-hosted video library for [Playa](https://github.com/Playa-vr) and [DeoVR](https://deovr.com) (Meta Quest), served as a Home Assistant add-on: local files, web pages and yt-dlp sources, automatic VR projection detection, built-in diagnostics.*
 
 </div>
 
@@ -24,12 +24,22 @@ DeoVR kann Bibliotheken von Servern laden, die ein bestimmtes JSON-Format sprech
 - 🕶️ **VR-Format**: Erkennung über den Dateinamen (`180`, `360`, `LR`, `TB`, `FISHEYE` …) oder automatisch aus der Bildgröße
 - 🖼️ **Vorschaubilder**: werden mit ffmpeg erzeugt (bei 3D nur ein Auge) und zwischengespeichert
 - 🔎 **Diagnose**: `/debug` und `/selftest` zeigen, was DeoVR wirklich abruft
+- 🌴 **Playa**: die gleiche Bibliothek ist auch ein Playa-Server (Playa API v2 unter `/api/playa/v2`) — die Playa-VR-App verbindet sich direkt mit der Server-Adresse
+
+## Auch für die Playa-App
+
+[Playa](https://github.com/Playa-vr/Playa-vr) ist ein VR-Video-Player für Meta Quest (Open-Source-Alternative zu DeoVR). Der Server spricht neben dem DeoVR-JSON auch die **Playa API v2**:
+
+1. Playa starten, über das Zahnrad-Symbol **„Connect a server“**
+2. Die Server-Adresse ohne Pfad eintragen (z. B. `http://192.168.1.21:8123/api/playa/deovr` beim HA-Add-on, oder `http://<deine-IP>:8000` direkt)
+
+Die App fragt `/api/playa/v2/config`, `/categories` und `/videos` ab; Video-Listen, Kategorien (Unterordner), Vorschaubilder und VR-Formate (Projektion/Stereo aus der Erkennung) laufen wie bei DeoVR. Authentifizierung ist abgeschaltet, es werden keine Profil-Codes gebraucht. Gespielt wird über die bestehenden `/video/…`-Adressen (inkl. Range-Anfragen).
 
 ## Screenshot
 
 Die Diagnoseseite (`/debug`, im Add-on über „Web-UI öffnen“) mit erkannten Formaten, Codecs und Vorschaubildern:
 
-![Diagnoseseite des DeoVR-Servers](docs/debug.png)
+![Diagnoseseite des Servers](docs/debug.png)
 
 > Die Demo-Videos im Bild sind synthetische Testbilder.
 
@@ -38,8 +48,8 @@ Die Diagnoseseite (`/debug`, im Add-on über „Web-UI öffnen“) mit erkannten
 ### Als Add-on-Repository (empfohlen)
 
 1. In Home Assistant: **Einstellungen → Add-ons → Add-on-Store → ⋮ → Repositories**
-2. `https://github.com/gier76/deovr_server_web` hinzufügen (oder oben auf den Badge klicken)
-3. **DeoVR Server** installieren und starten
+2. `https://github.com/gier76/playavr-server-web` hinzufügen (oder oben auf den Badge klicken)
+3. **PlayaVR Server** installieren und starten
 4. Videos nach `media/deovr` legen (z. B. über die Samba-Freigabe)
 5. In DeoVR auf der Quest öffnen: `http://<HA-IP>:8000/deovr`
 
@@ -47,7 +57,7 @@ Die Diagnoseseite (`/debug`, im Add-on über „Web-UI öffnen“) mit erkannten
 
 ### Als lokales Add-on
 
-Den Ordner `deovr/` nach `/addons/deovr/` kopieren (`/addons/deovr/config.yaml` muss existieren), dann *Add-on-Store → ⋮ → Auf Updates prüfen* und unter „Lokale Add-ons“ installieren.
+Den Ordner `playavr-server-web/` nach `/addons/playavr-server-web/` kopieren (`/addons/playavr-server-web/config.yaml` muss existieren), dann *Add-on-Store → ⋮ → Auf Updates prüfen* und unter „Lokale Add-ons“ installieren.
 
 ## Konfiguration
 

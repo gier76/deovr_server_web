@@ -29,6 +29,6 @@ bashio::log.info "Webquellen:  $(echo "${SOURCES_JSON}" | jq 'length')"
 if [ -n "${PUBLIC_URL}" ]; then
     bashio::log.info "Basis-URL:   ${PUBLIC_URL}"
 fi
-bashio::log.info "DeoVR-URL:   http://<HA-IP>:8000/deovr  (Diagnose: /debug)"
+bashio::log.info "Playa-URL:   http://<HA-IP>:8000  (DeoVR: /deovr, Diagnose: /debug)"
 
 exec python3 /app/server.py
